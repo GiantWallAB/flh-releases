@@ -87,20 +87,20 @@ cleanup() {
   fi
 }
 
-# on_signal forwards the received signal to the active transfer and to the
-# authenticated bootstrap child, waits for the child's graceful installer
-# rollback/exit, and exits with the signal status. The EXIT trap then removes
-# the private temp directory on the way out.
+# on_signal maps every supported parent signal to TERM for active children,
+# waits for their graceful exit, and then preserves the parent's signal-style
+# exit status. Background curl inherits ignored INT from POSIX shells, while
+# the Go bootstrap owns graceful cancellation only for INT/TERM (not HUP), so
+# forwarding the original signal would be unsafe for both cases.
 on_signal() {
-  flh_signal_name=$1
-  flh_signal_status=$2
+  flh_signal_status=$1
   if [ -n "$flh_curl_pid" ]; then
-    kill -s "$flh_signal_name" "$flh_curl_pid" 2>/dev/null || true
+    kill -s TERM "$flh_curl_pid" 2>/dev/null || true
     wait "$flh_curl_pid" 2>/dev/null || true
     flh_curl_pid=""
   fi
   if [ -n "$flh_bootstrap_child_pid" ]; then
-    kill -s "$flh_signal_name" "$flh_bootstrap_child_pid" 2>/dev/null || true
+    kill -s TERM "$flh_bootstrap_child_pid" 2>/dev/null || true
     wait "$flh_bootstrap_child_pid" 2>/dev/null || true
     flh_bootstrap_child_pid=""
   fi
@@ -517,9 +517,9 @@ if [ "$(id -u)" != "$(stat -f '%u' "$flh_bootstrap_tmp")" ]; then
   fail "the private bootstrap temp directory must be owned by the invoking user"
 fi
 trap 'cleanup' EXIT
-trap 'on_signal HUP 129' HUP
-trap 'on_signal INT 130' INT
-trap 'on_signal TERM 143' TERM
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 # The shell's ulimit file-size unit is not portable (POSIX sh and zsh count
 # 512-byte blocks; macOS bash counts 1024-byte blocks), so measure it once by
