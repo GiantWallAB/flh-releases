@@ -183,9 +183,12 @@ case $behavior in
     ;;
   oversize-stream)
     bytes=${FAKE_OVERSIZE_BYTES:-0}
-    dd if=/dev/zero of="$out" bs=1024 count=$((bytes / 1024)) 2>/dev/null
+    dd if=/dev/zero of="$out" bs=65536 count=$((bytes / 65536)) 2>/dev/null
+    stream_status=$?
+    printf 'stream-status %s\n' "$stream_status" >> "$FAKE_LOG"
+    printf 'stream-size %s\n' "$(wc -c < "$out" 2>/dev/null | tr -d '[:space:]')" >> "$FAKE_LOG"
     printf '200'
-    exit 0
+    exit "$stream_status"
     ;;
   hang)
     exec sleep 300
@@ -300,6 +303,11 @@ write_standalone() {
   for argument in "$@"; do printf ' %s' "$argument"; done
   printf '\n'
 } >> "$FAKE_LOG"
+if [ "${FAKE_RUN_HANG:-0}" = "1" ]; then
+  trap 'printf "child-signal\n" >> "$FAKE_LOG"; exit 143' TERM INT HUP
+  printf 'child-ready\n' >> "$FAKE_LOG"
+  while :; do sleep 1; done
+fi
 exit "${FAKE_RUN_EXIT:-0}"
 STANDALONE
   chmod +x "$serve/flh-darwin-arm64"
@@ -310,6 +318,7 @@ reset_scenario() {
   binary_behavior=ok
   codesign_behavior=ok
   run_exit=0
+  run_hang=0
   flaky_fails=0
   codesign_team=ABCDE12345
   codesign_identifier=com.giantwall.flh.bootstrap
@@ -325,11 +334,11 @@ reset_scenario() {
   write_standalone
 }
 
-run_install() {
+start_install() {
   script=$1
   shift
   : > "$log"
-  if env \
+  env \
     PATH="$bin:$PATH" \
     TMPDIR="$sandbox" \
     FAKE_LOG="$log" \
@@ -339,13 +348,20 @@ run_install() {
     FAKE_CURL_BEHAVIOR_BINARY="$binary_behavior" \
     FAKE_CODESIGN_BEHAVIOR="$codesign_behavior" \
     FAKE_RUN_EXIT="$run_exit" \
+    FAKE_RUN_HANG="$run_hang" \
     FAKE_FLAKY_FAILS="$flaky_fails" \
     FAKE_CODESIGN_TEAM="$codesign_team" \
     FAKE_CODESIGN_IDENTIFIER="$codesign_identifier" \
     FAKE_OVERSIZE_BYTES="$oversize_bytes" \
     FAKE_UNAME_S="$uname_s" \
     FAKE_UNAME_M="$uname_m" \
-    sh "$script" "$@" > "$stdout" 2> "$stderr"; then
+    sh "$script" "$@" > "$stdout" 2> "$stderr" &
+  background_pid=$!
+}
+
+run_install() {
+  start_install "$@"
+  if wait "$background_pid"; then
     run_status=0
   else
     run_status=$?
@@ -514,6 +530,32 @@ test_alpha_parsing() {
   assert_eq "alpha additive fields: exit 0" 0 "$run_status"
   assert_contains "alpha additive fields: resolved version" "$log" "download/v0.2.0-alpha.7/flh-darwin-arm64"
 
+  # An additive nested object reusing the reserved names must be ignored; a
+  # line-based reader would have counted the nested version key as a second
+  # identity and rejected a valid document.
+  reset_scenario
+  write_alpha '{
+  "version": "v0.2.0-alpha.7",
+  "candidate_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "meta": {"version": "v9", "candidate_sha256": "not-a-digest"}
+}'
+  run_install "$provisioned"
+  assert_eq "alpha nested additive identities: exit 0" 0 "$run_status"
+  assert_contains "alpha nested additive identities: resolved version" "$log" "download/v0.2.0-alpha.7/flh-darwin-arm64"
+
+  # A nested-only identity is not a top-level identity.
+  reset_scenario
+  write_alpha '{
+  "meta": {
+    "version": "v0.2.0-alpha.7",
+    "candidate_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}'
+  run_install "$provisioned"
+  assert_eq "alpha nested-only identity: exit 1" 1 "$run_status"
+  assert_contains "alpha nested-only identity: diagnostic" "$stderr" "no promoted version"
+  assert_eq "alpha nested-only identity: no standalone fetch" 0 "$(count_matching 'download/')"
+
   reset_scenario
   write_alpha '{
   "version": "v0.2.0-alpha.7",
@@ -524,12 +566,19 @@ test_alpha_parsing() {
   assert_eq "alpha literal additive value: exit 0" 0 "$run_status"
   assert_contains "alpha literal additive value: resolved version" "$log" "download/v0.2.0-alpha.7/flh-darwin-arm64"
 
+  # JSON string escapes are decoded structurally before the grammar check.
+  reset_scenario
+  write_alpha '{"version":"v0.1.0-\u0061lpha.3","candidate_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+  run_install "$provisioned"
+  assert_eq "alpha escaped canonical version: exit 0" 0 "$run_status"
+  assert_contains "alpha escaped canonical version: resolved version" "$log" "download/v0.1.0-alpha.3/flh-darwin-arm64"
+
   reset_scenario
   write_alpha '{"state":"no-promoted-version"}'
   run_install "$provisioned"
   assert_eq "alpha unpromoted: exit 1" 1 "$run_status"
   assert_contains "alpha unpromoted: diagnostic" "$stderr" "no promoted version"
-  assert_eq "alpha unpromoted: no standalone fetch" 0 "$(count_matching 'flh-darwin-arm64')"
+  assert_eq "alpha unpromoted: no standalone fetch" 0 "$(count_matching 'download/')"
   assert_clean_sandbox "alpha unpromoted: temp cleaned"
 
   reset_scenario
@@ -537,6 +586,20 @@ test_alpha_parsing() {
   run_install "$provisioned"
   assert_eq "alpha missing candidate: exit 1" 1 "$run_status"
   assert_contains "alpha missing candidate: diagnostic" "$stderr" "candidate_sha256"
+  assert_eq "alpha missing candidate: no standalone fetch" 0 "$(count_matching 'download/')"
+
+  reset_scenario
+  write_alpha '{"version":"v0.1.0-alpha.3",'
+  run_install "$provisioned"
+  assert_eq "alpha malformed JSON: exit 1" 1 "$run_status"
+  assert_contains "alpha malformed JSON: diagnostic" "$stderr" "not valid JSON"
+  assert_eq "alpha malformed JSON: no standalone fetch" 0 "$(count_matching 'download/')"
+
+  reset_scenario
+  write_alpha '{"version":"v0.1.0-alpha.3","candidate_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"} trailing'
+  run_install "$provisioned"
+  assert_eq "alpha trailing data: exit 1" 1 "$run_status"
+  assert_contains "alpha trailing data: diagnostic" "$stderr" "not valid JSON"
 
   reset_scenario
   write_alpha '{"version":"v0.1.0-alpha.03","candidate_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
@@ -545,16 +608,48 @@ test_alpha_parsing() {
   assert_contains "alpha malformed version: diagnostic" "$stderr" "not a production version"
 
   reset_scenario
+  write_alpha '{"version":"v0.1.0-alpha.3\n","candidate_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+  run_install "$provisioned"
+  assert_eq "alpha newline escape in version: exit 1" 1 "$run_status"
+  assert_contains "alpha newline escape in version: diagnostic" "$stderr" "not a production version"
+
+  reset_scenario
+  write_alpha '{"version":123,"candidate_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+  run_install "$provisioned"
+  assert_eq "alpha non-string version: exit 1" 1 "$run_status"
+  assert_contains "alpha non-string version: diagnostic" "$stderr" "not a JSON string"
+
+  reset_scenario
   write_alpha '{"version":"v0.1.0-alpha.3","candidate_sha256":"aaaa"}'
   run_install "$provisioned"
   assert_eq "alpha noncanonical candidate: exit 1" 1 "$run_status"
   assert_contains "alpha noncanonical candidate: diagnostic" "$stderr" "candidate_sha256"
 
   reset_scenario
+  write_alpha '{"version":"v0.1.0-alpha.3","candidate_sha256":123}'
+  run_install "$provisioned"
+  assert_eq "alpha non-string candidate: exit 1" 1 "$run_status"
+  assert_contains "alpha non-string candidate: diagnostic" "$stderr" "candidate_sha256 is not a JSON string"
+
+  reset_scenario
   write_alpha '{"version":"v0.1.0-alpha.3","version":"v0.1.0-alpha.3","candidate_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
   run_install "$provisioned"
-  assert_eq "alpha duplicate version: exit 1" 1 "$run_status"
-  assert_contains "alpha duplicate version: diagnostic" "$stderr" "more than one version"
+  assert_eq "alpha duplicate top-level version: exit 1" 1 "$run_status"
+  assert_contains "alpha duplicate top-level version: diagnostic" "$stderr" "duplicate object keys"
+
+  reset_scenario
+  write_alpha '{"version":"v0.1.0-alpha.3","candidate_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":{"k":1,"k":2}}'
+  run_install "$provisioned"
+  assert_eq "alpha duplicate nested key: exit 1" 1 "$run_status"
+  assert_contains "alpha duplicate nested key: diagnostic" "$stderr" "duplicate object keys"
+
+  # Duplicate detection is on decoded keys: an escaped spelling of a key that
+  # another literal key already used is still a duplicate.
+  reset_scenario
+  write_alpha '{"version":"v0.1.0-alpha.3","candidate_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","m\u0065ta":1,"meta":2}'
+  run_install "$provisioned"
+  assert_eq "alpha duplicate decoded keys: exit 1" 1 "$run_status"
+  assert_contains "alpha duplicate decoded keys: diagnostic" "$stderr" "duplicate object keys"
 
   reset_scenario
   write_alpha '[]'
@@ -574,11 +669,14 @@ test_fetch_bounds() {
 
   reset_scenario
   alpha_behavior=oversize-stream
-  oversize_bytes=131072
+  oversize_bytes=1048576
   run_install "$provisioned"
   assert_eq "alpha streamed oversize: exit 1" 1 "$run_status"
   assert_contains "alpha streamed oversize: diagnostic" "$stderr" "limit"
-  assert_eq "alpha streamed oversize: no standalone fetch" 0 "$(count_matching 'flh-darwin-arm64')"
+  assert_eq "alpha streamed oversize: no retry" 1 "$(count_matching '/alpha.json')"
+  assert_eq "alpha streamed oversize: no standalone fetch" 0 "$(count_matching 'download/')"
+  assert_contains "alpha streamed oversize: writer stopped by the OS limit" "$log" "stream-status 153"
+  assert_eq "alpha streamed oversize: destination never exceeded the cap" 65536 "$(sed -n 's/^stream-size //p' "$log" | tail -1)"
 
   reset_scenario
   binary_behavior=oversize-declared
@@ -590,12 +688,15 @@ test_fetch_bounds() {
 
   reset_scenario
   binary_behavior=oversize-stream
-  oversize_bytes=134218752
+  oversize_bytes=268435456
   run_install "$provisioned" --version v0.1.0-alpha.3
   assert_eq "standalone streamed oversize: exit 1" 1 "$run_status"
   assert_contains "standalone streamed oversize: diagnostic" "$stderr" "limit"
+  assert_eq "standalone streamed oversize: no retry" 1 "$(count_matching 'download/v0.1.0-alpha.3/flh-darwin-arm64')"
   assert_eq "standalone streamed oversize: never verified" 0 "$(count_matching '^codesign ')"
   assert_eq "standalone streamed oversize: never run" 0 "$(count_matching '^run ')"
+  assert_contains "standalone streamed oversize: writer stopped by the OS limit" "$log" "stream-status 153"
+  assert_eq "standalone streamed oversize: destination never exceeded the cap" 134217728 "$(sed -n 's/^stream-size //p' "$log" | tail -1)"
   assert_clean_sandbox "standalone streamed oversize: temp cleaned"
 }
 
@@ -710,28 +811,41 @@ test_invocation_and_exit() {
   assert_clean_sandbox "child exit: temp cleaned"
 }
 
+test_version_injection() {
+  reset_scenario
+  newline_junk='v0.1.0-alpha.3
+junk'
+  run_install "$provisioned" --version "$newline_junk"
+  assert_eq "version with newline junk: exit 2" 2 "$run_status"
+  assert_file_empty "version with newline junk: no fetch" "$log"
+
+  reset_scenario
+  preceding_line='junk
+v0.1.0-alpha.3'
+  run_install "$provisioned" --version "$preceding_line"
+  assert_eq "version after a preceding line: exit 2" 2 "$run_status"
+  assert_file_empty "version after a preceding line: no fetch" "$log"
+
+  reset_scenario
+  trailing_newline='v0.1.0-alpha.3
+'
+  run_install "$provisioned" --version "$trailing_newline"
+  assert_eq "version with a trailing newline: exit 2" 2 "$run_status"
+  assert_file_empty "version with a trailing newline: no fetch" "$log"
+
+  reset_scenario
+  trailing_cr=$(printf 'v0.1.0-alpha.3\r')
+  run_install "$provisioned" --version "$trailing_cr"
+  assert_eq "version with a trailing carriage return: exit 2" 2 "$run_status"
+  assert_file_empty "version with a trailing carriage return: no fetch" "$log"
+
+  assert_clean_sandbox "version injection creates no temp"
+}
+
 test_signal_cleanup() {
   reset_scenario
   alpha_behavior=hang
-  : > "$log"
-  env \
-    PATH="$bin:$PATH" \
-    TMPDIR="$sandbox" \
-    FAKE_LOG="$log" \
-    FAKE_SERVE_DIR="$serve" \
-    FAKE_STATE_DIR="$fake_state" \
-    FAKE_CURL_BEHAVIOR_ALPHA="$alpha_behavior" \
-    FAKE_CURL_BEHAVIOR_BINARY="$binary_behavior" \
-    FAKE_CODESIGN_BEHAVIOR="$codesign_behavior" \
-    FAKE_RUN_EXIT="$run_exit" \
-    FAKE_FLAKY_FAILS="$flaky_fails" \
-    FAKE_CODESIGN_TEAM="$codesign_team" \
-    FAKE_CODESIGN_IDENTIFIER="$codesign_identifier" \
-    FAKE_OVERSIZE_BYTES="$oversize_bytes" \
-    FAKE_UNAME_S="$uname_s" \
-    FAKE_UNAME_M="$uname_m" \
-    sh "$provisioned" > "$stdout" 2> "$stderr" &
-  script_pid=$!
+  start_install "$provisioned"
   waited=0
   while [ ! -s "$log" ] && [ "$waited" -lt 100 ]; do
     sleep 0.1
@@ -739,21 +853,47 @@ test_signal_cleanup() {
   done
   if [ ! -s "$log" ]; then
     fail "signal cleanup: script reached the hanging fetch"
-    kill "$script_pid" 2>/dev/null || true
-    wait "$script_pid" 2>/dev/null || true
+    kill "$background_pid" 2>/dev/null || true
+    wait "$background_pid" 2>/dev/null || true
     return
   fi
-  kill -TERM "$script_pid" 2>/dev/null || true
-  wait "$script_pid" 2>/dev/null
+  kill -TERM "$background_pid" 2>/dev/null || true
+  wait "$background_pid" 2>/dev/null
   signal_status=$?
   assert_eq "signal cleanup: TERM exit status" 143 "$signal_status"
   assert_clean_sandbox "signal cleanup: temp cleaned"
+}
+
+test_signal_during_handoff() {
+  reset_scenario
+  run_hang=1
+  start_install "$provisioned" --version v0.1.0-alpha.3
+  waited=0
+  while ! grep -Fq 'child-ready' "$log" 2>/dev/null && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if ! grep -Fq 'child-ready' "$log" 2>/dev/null; then
+    fail "handoff signal: authenticated child reached the handoff"
+    kill "$background_pid" 2>/dev/null || true
+    wait "$background_pid" 2>/dev/null || true
+    return
+  fi
+  kill -TERM "$background_pid" 2>/dev/null || true
+  wait "$background_pid" 2>/dev/null
+  signal_status=$?
+  assert_eq "handoff signal: exit status" 143 "$signal_status"
+  assert_contains "handoff signal: child received the forwarded signal" "$log" "child-signal"
+  assert_eq "handoff signal: one authenticated invocation" 1 "$(count_matching '^run ')"
+  assert_eq "handoff signal: child did not outlive the script" 1 "$(count_matching 'child-signal')"
+  assert_clean_sandbox "handoff signal: temp cleaned"
 }
 
 test_repository_surface
 test_unprovisioned
 test_pin_validation
 test_usage_errors
+test_version_injection
 test_platform_gate
 test_explicit_success
 test_no_version_success
@@ -764,6 +904,7 @@ test_attempt_budget
 test_apple_verification_failures
 test_invocation_and_exit
 test_signal_cleanup
+test_signal_during_handoff
 
 printf '\n%s passed, %s failed\n' "$((test_count - failure_count))" "$failure_count"
 if [ "$failure_count" -eq 0 ]; then
