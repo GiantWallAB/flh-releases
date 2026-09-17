@@ -68,6 +68,7 @@ FLH_APPLE_DESIGNATED_REQUIREMENT=""
 
 flh_bootstrap_tmp=""
 flh_curl_pid=""
+flh_bootstrap_child_pid=""
 
 fail() {
   printf 'flh install: %s\n' "$1" >&2
@@ -86,17 +87,36 @@ cleanup() {
   fi
 }
 
+# on_signal forwards the received signal to the active transfer and to the
+# authenticated bootstrap child, waits for the child's graceful installer
+# rollback/exit, and exits with the signal status. The EXIT trap then removes
+# the private temp directory on the way out.
 on_signal() {
+  flh_signal_name=$1
+  flh_signal_status=$2
   if [ -n "$flh_curl_pid" ]; then
-    kill "$flh_curl_pid" 2>/dev/null || true
+    kill -s "$flh_signal_name" "$flh_curl_pid" 2>/dev/null || true
+    wait "$flh_curl_pid" 2>/dev/null || true
+    flh_curl_pid=""
   fi
-  exit "$1"
+  if [ -n "$flh_bootstrap_child_pid" ]; then
+    kill -s "$flh_signal_name" "$flh_bootstrap_child_pid" 2>/dev/null || true
+    wait "$flh_bootstrap_child_pid" 2>/dev/null || true
+    flh_bootstrap_child_pid=""
+  fi
+  exit "$flh_signal_status"
 }
 
 # is_production_version checks the canonical production grammar
 # v<major>.<minor>.<patch>-alpha.<ordinal>; no other suffix, build metadata,
-# or prerelease identifier is a production version.
+# or prerelease identifier is a production version. grep is line-based, so a
+# value carrying a newline could otherwise match on its first line and smuggle
+# trailing bytes into the resolved release URL; the whole string is validated.
 is_production_version() {
+  case $1 in
+    *'
+'*) return 1 ;;
+  esac
   printf '%s\n' "$1" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha\.(0|[1-9][0-9]*)$'
 }
 
@@ -134,9 +154,16 @@ require_apple_pins() {
   fi
 }
 
+# bounded_diagnostic returns one bounded, single-line, printable excerpt of a
+# diagnostic file so a hostile peer cannot inject control characters into the
+# terminal through an error message.
+bounded_diagnostic() {
+  head -c 512 "$1" 2>/dev/null | LC_ALL=C tr -c ' -~' ' ' | tr -s ' '
+}
+
 curl_error_excerpt() {
   if [ -s "$flh_curl_error_file" ]; then
-    head -c 512 "$flh_curl_error_file" 2>/dev/null | tr '\n' ' '
+    bounded_diagnostic "$flh_curl_error_file"
   else
     printf 'transport failure'
   fi
@@ -146,29 +173,41 @@ curl_error_excerpt() {
 # and every redirect target, at most FLH_MAX_REDIRECTS redirects, a
 # connect/response-header stall deadline of FLH_CONNECT_TIMEOUT_SECONDS (the
 # speed floor aborts a connected peer that sends fewer than 1 byte per second
-# for that window), a per-attempt transfer deadline, and a byte cap enforced
-# both on the declared length and on the bytes actually written. Redirect
-# policy and transport failures are classified by the caller.
+# for that window), a per-attempt transfer deadline, and the byte cap. The cap
+# is enforced independently of the curl version: --max-filesize rejects a
+# declared length early (and, on curl >= 8.4.0, aborts an oversized stream),
+# while the subshell lowers the OS file-size limit (RLIMIT_FSIZE, in the
+# shell's measured ulimit unit) to exactly the cap and then execs curl, so on
+# every system curl version the kernel stops an unknown-length stream at the
+# cap instead of writing the whole body. exec preserves the background PID, so
+# cancellation still targets the transfer directly.
 run_curl_once() {
   flh_curl_status_file=$flh_bootstrap_tmp/curl-status
   flh_curl_error_file=$flh_bootstrap_tmp/curl-error
+  flh_curl_file_blocks=$(( $3 / flh_ulimit_unit ))
   rm -f -- "$2" "$flh_curl_status_file" "$flh_curl_error_file"
   : > "$flh_curl_status_file"
   : > "$flh_curl_error_file"
-  curl --disable \
-    --proto '=https' \
-    --proto-redir '=https' \
-    --max-redirs "$FLH_MAX_REDIRECTS" \
-    --location \
-    --connect-timeout "$FLH_CONNECT_TIMEOUT_SECONDS" \
-    --speed-limit 1 \
-    --speed-time "$FLH_CONNECT_TIMEOUT_SECONDS" \
-    --max-time "$FLH_TRANSFER_TIMEOUT_SECONDS" \
-    --max-filesize "$3" \
-    --silent --show-error \
-    --output "$2" \
-    --write-out '%{http_code}' \
-    "$1" < /dev/null > "$flh_curl_status_file" 2> "$flh_curl_error_file" &
+  (
+    ulimit -f "$flh_curl_file_blocks" 2>/dev/null || {
+      printf 'unable to apply the %s-byte file-size limit\n' "$3" >&2
+      exit 125
+    }
+    exec curl --disable \
+      --proto '=https' \
+      --proto-redir '=https' \
+      --max-redirs "$FLH_MAX_REDIRECTS" \
+      --location \
+      --connect-timeout "$FLH_CONNECT_TIMEOUT_SECONDS" \
+      --speed-limit 1 \
+      --speed-time "$FLH_CONNECT_TIMEOUT_SECONDS" \
+      --max-time "$FLH_TRANSFER_TIMEOUT_SECONDS" \
+      --max-filesize "$3" \
+      --silent --show-error \
+      --output "$2" \
+      --write-out '%{http_code}' \
+      "$1"
+  ) < /dev/null > "$flh_curl_status_file" 2> "$flh_curl_error_file" &
   flh_curl_pid=$!
   if wait "$flh_curl_pid"; then
     flh_curl_status=0
@@ -203,6 +242,19 @@ fetch_bounded() {
   while [ "$fetch_attempt" -le "$FLH_MAX_ATTEMPTS" ]; do
     run_curl_once "$fetch_url" "$fetch_destination" "$fetch_cap"
     flh_http_code=$(tr -d '[:space:]' < "$flh_curl_status_file" 2>/dev/null || true)
+    fetch_size=""
+    if [ -f "$fetch_destination" ] && [ ! -L "$fetch_destination" ]; then
+      fetch_size=$(wc -c < "$fetch_destination" 2>/dev/null | tr -d '[:space:]') || fetch_size=""
+    fi
+    case $fetch_size in
+      ''|*[!0-9]*) fetch_size=0 ;;
+    esac
+    # A stream that reached the cap without completing cleanly was cut off by
+    # the OS file-size limit or by curl's max-filesize check; it is never
+    # accepted, verified, or installed.
+    if [ "$fetch_size" -ge "$fetch_cap" ] && [ "$flh_curl_status" -ne 0 ]; then
+      fail "$fetch_description exceeds its $fetch_cap-byte limit"
+    fi
     if [ "$flh_curl_status" -eq 0 ]; then
       case $flh_http_code in
         200) ;;
@@ -219,7 +271,8 @@ fetch_bounded() {
       esac
     else
       case $flh_curl_status in
-        63) fail "$fetch_description exceeds its $fetch_cap-byte limit" ;;
+        63|153) fail "$fetch_description exceeds its $fetch_cap-byte limit" ;;
+        125) fail "unable to apply the $fetch_cap-byte limit to $fetch_description" ;;
         47) fail "$fetch_description exceeded the $FLH_MAX_REDIRECTS-redirect limit" ;;
         1) fail "$fetch_description refused a non-HTTPS URL or redirect" ;;
         *)
@@ -231,10 +284,6 @@ fetch_bounded() {
     if [ ! -f "$fetch_destination" ] || [ -L "$fetch_destination" ]; then
       fail "$fetch_description did not produce a regular private file"
     fi
-    fetch_size=$(wc -c < "$fetch_destination" 2>/dev/null | tr -d '[:space:]') || true
-    case $fetch_size in
-      ''|*[!0-9]*) fail "$fetch_description size is unreadable" ;;
-    esac
     if [ "$fetch_size" -eq 0 ]; then
       fail "$fetch_description is empty"
     fi
@@ -246,35 +295,140 @@ fetch_bounded() {
   fail "$fetch_description failed after $FLH_MAX_ATTEMPTS attempts"
 }
 
-# parse_alpha_json reads the promoted version from the minimum alpha.json
-# shape: exactly one canonical production `version` string and exactly one
-# canonical lowercase `candidate_sha256`. Additive fields are ignored and the
-# absent-version initial state fails closed without guessing.
+# parse_alpha_json structurally decodes the minimum alpha.json shape: exactly
+# one top-level canonical production `version` string and exactly one top-level
+# canonical lowercase `candidate_sha256` string. Additive fields, including
+# nested objects that reuse those names, are ignored. Malformed JSON, a
+# non-object root, duplicate decoded object keys anywhere, trailing data,
+# non-string or noncanonical identities, and the no-promoted-version initial
+# state all fail closed without guessing. The system Perl and its core
+# JSON::PP module ship on every supported clean macOS; JSON::PP normalizes
+# duplicate keys, so the reader also walks the validated bytes with an exact
+# decoded-key duplicate scanner before trusting the document.
 parse_alpha_json() {
-  alpha_raw=$(cat "$1") || fail "unable to read the downloaded alpha.json"
-  alpha_trimmed=$(printf '%s' "$alpha_raw" | tr -d '[:space:]')
-  case $alpha_trimmed in
-    \{*\}) ;;
-    *) fail "alpha.json is not a JSON object" ;;
-  esac
-  alpha_version_count=$(printf '%s\n' "$alpha_raw" | grep -o '"version"[[:space:]]*:' | wc -l | tr -d '[:space:]')
-  if [ "$alpha_version_count" -eq 0 ]; then
-    fail "alpha.json carries no promoted version; pass --version <production-version> to install an exact release"
-  fi
-  if [ "$alpha_version_count" -ne 1 ]; then
-    fail "alpha.json is malformed: it names more than one version field"
-  fi
-  alpha_candidate_count=$(printf '%s\n' "$alpha_raw" | grep -o '"candidate_sha256"[[:space:]]*:' | wc -l | tr -d '[:space:]')
-  if [ "$alpha_candidate_count" -ne 1 ]; then
-    fail "alpha.json is malformed: it must carry exactly one candidate_sha256"
-  fi
-  flh_alpha_version=$(printf '%s\n' "$alpha_raw" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-  if ! is_production_version "$flh_alpha_version"; then
-    fail "alpha.json version is not a production version v<major>.<minor>.<patch>-alpha.<ordinal>"
-  fi
-  alpha_candidate=$(printf '%s\n' "$alpha_raw" | sed -n 's/.*"candidate_sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-  if ! printf '%s\n' "$alpha_candidate" | grep -Eq '^[0-9a-f]{64}$'; then
-    fail "alpha.json candidate_sha256 is not a canonical lowercase SHA-256"
+  flh_alpha_path=$1
+  flh_alpha_version_file=$flh_bootstrap_tmp/alpha-version
+  flh_alpha_error_file=$flh_bootstrap_tmp/alpha-error
+  rm -f -- "$flh_alpha_version_file" "$flh_alpha_error_file"
+  : > "$flh_alpha_error_file"
+  if /usr/bin/perl - "$flh_alpha_path" > "$flh_alpha_version_file" 2> "$flh_alpha_error_file" <<'FLH_ALPHA_PARSER'
+use strict;
+use warnings;
+use JSON::PP ();
+
+my $path = @ARGV == 1 ? $ARGV[0] : die "alpha.json path is missing\n";
+open my $handle, '<:raw', $path or die "unable to open alpha.json\n";
+my $raw = do { local $/; <$handle> };
+close $handle;
+
+my $decoder = JSON::PP->new->utf8;
+my $document = eval { $decoder->decode($raw) };
+die "alpha.json is not valid JSON\n" if $@;
+die "alpha.json is not a JSON object\n" unless ref($document) eq 'HASH';
+
+my $text = $raw;
+my $position = 0;
+my $duplicate = 0;
+my %top_level;
+
+sub skip_whitespace {
+    while ($position < length($text) && substr($text, $position, 1) =~ /[ \t\r\n]/) {
+        $position++;
+    }
+}
+
+sub scan_string_token {
+    my $start = $position;
+    die "alpha.json is not valid JSON\n" unless substr($text, $start, 1) eq '"';
+    my $index = $start + 1;
+    while ($index < length($text)) {
+        my $character = substr($text, $index, 1);
+        if ($character eq '\\') { $index += 2; next; }
+        if ($character eq '"') {
+            $position = $index + 1;
+            return substr($text, $start, $position - $start);
+        }
+        $index++;
+    }
+    die "alpha.json is not valid JSON\n";
+}
+
+sub scan_value {
+    my ($at_top_level) = @_;
+    skip_whitespace();
+    my $character = substr($text, $position, 1);
+    if ($character eq '{') {
+        $position++;
+        skip_whitespace();
+        if (substr($text, $position, 1) eq '}') { $position++; return; }
+        my %seen;
+        while (1) {
+            skip_whitespace();
+            my $key_token = scan_string_token();
+            my $key = $decoder->decode($key_token);
+            $duplicate = 1 if $seen{$key}++;
+            skip_whitespace();
+            die "alpha.json is not valid JSON\n" unless substr($text, $position, 1) eq ':';
+            $position++;
+            my $value_token = scan_value(0);
+            if ($at_top_level) {
+                $top_level{$key} = defined $value_token ? $value_token : '';
+            }
+            skip_whitespace();
+            my $separator = substr($text, $position, 1);
+            if ($separator eq ',') { $position++; next; }
+            if ($separator eq '}') { $position++; return; }
+            die "alpha.json is not valid JSON\n";
+        }
+    }
+    if ($character eq '[') {
+        $position++;
+        skip_whitespace();
+        if (substr($text, $position, 1) eq ']') { $position++; return; }
+        while (1) {
+            scan_value(0);
+            skip_whitespace();
+            my $separator = substr($text, $position, 1);
+            if ($separator eq ',') { $position++; next; }
+            if ($separator eq ']') { $position++; return; }
+            die "alpha.json is not valid JSON\n";
+        }
+    }
+    if ($character eq '"') { return scan_string_token(); }
+    my $start = $position;
+    while ($position < length($text)) {
+        my $byte = substr($text, $position, 1);
+        last if $byte =~ /[ \t\r\n,\]\}]/;
+        $position++;
+    }
+    die "alpha.json is not valid JSON\n" if $position == $start;
+    return substr($text, $start, $position - $start);
+}
+
+scan_value(1);
+die "alpha.json contains duplicate object keys\n" if $duplicate;
+
+die "alpha.json carries no promoted version; pass --version <production-version> to install an exact release\n"
+    unless exists $top_level{'version'};
+die "alpha.json is missing candidate_sha256\n"
+    unless exists $top_level{'candidate_sha256'};
+die "alpha.json version is not a JSON string\n" unless $top_level{'version'} =~ /^"/;
+die "alpha.json candidate_sha256 is not a JSON string\n" unless $top_level{'candidate_sha256'} =~ /^"/;
+
+my $version = $decoder->decode($top_level{'version'});
+my $candidate = $decoder->decode($top_level{'candidate_sha256'});
+die "alpha.json version is not a production version v<major>.<minor>.<patch>-alpha.<ordinal>\n"
+    unless $version =~ /\Av(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha\.(0|[1-9][0-9]*)\z/;
+die "alpha.json candidate_sha256 is not a canonical lowercase SHA-256\n"
+    unless $candidate =~ /\A[0-9a-f]{64}\z/;
+
+print $version, "\n";
+FLH_ALPHA_PARSER
+  then
+    flh_alpha_version=$(cat "$flh_alpha_version_file") || fail "unable to read the resolved alpha.json version"
+  else
+    flh_alpha_error=$(bounded_diagnostic "$flh_alpha_error_file")
+    fail "${flh_alpha_error:-alpha.json is invalid}"
   fi
 }
 
@@ -363,13 +517,33 @@ if [ "$(id -u)" != "$(stat -f '%u' "$flh_bootstrap_tmp")" ]; then
   fail "the private bootstrap temp directory must be owned by the invoking user"
 fi
 trap 'cleanup' EXIT
-trap 'on_signal 129' HUP
-trap 'on_signal 130' INT
-trap 'on_signal 143' TERM
+trap 'on_signal HUP 129' HUP
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+
+# The shell's ulimit file-size unit is not portable (POSIX sh and zsh count
+# 512-byte blocks; macOS bash counts 1024-byte blocks), so measure it once by
+# letting one block-limited write land, then scale each byte cap exactly into
+# the shell's own unit. A shell that cannot apply the limit or produce the
+# probe fails closed before any release byte is fetched.
+flh_ulimit_unit=0
+flh_ulimit_probe=$flh_bootstrap_tmp/ulimit-probe
+rm -f -- "$flh_ulimit_probe"
+if ( ulimit -f 1 2>/dev/null; dd if=/dev/zero of="$flh_ulimit_probe" bs=512 count=4 2>/dev/null ) 2>/dev/null; then :; fi
+flh_ulimit_probe_size=$(wc -c < "$flh_ulimit_probe" 2>/dev/null | tr -d '[:space:]') || flh_ulimit_probe_size=""
+rm -f -- "$flh_ulimit_probe"
+case $flh_ulimit_probe_size in
+  512) flh_ulimit_unit=512 ;;
+  1024) flh_ulimit_unit=1024 ;;
+  *) fail "unable to determine the shell file-size limit unit" ;;
+esac
 
 if [ "$version_seen" -ne 0 ]; then
   resolved_version=$requested_version
 else
+  if [ ! -x /usr/bin/perl ]; then
+    fail "the system Perl interpreter is required to resolve alpha.json; pass --version <production-version> to install an exact release"
+  fi
   alpha_path=$flh_bootstrap_tmp/alpha.json
   fetch_bounded "$FLH_ALPHA_JSON_URL" "$alpha_path" "$FLH_ALPHA_JSON_MAX_BYTES" "alpha.json"
   parse_alpha_json "$alpha_path"
@@ -383,9 +557,12 @@ verify_apple_signature "$standalone_path"
 chmod 500 "$standalone_path" || fail "unable to mark the authenticated release executable executable"
 
 printf 'flh install: handing off to the authenticated %s darwin/%s bootstrap\n' "$resolved_version" "$FLH_ARCH" >&2
-if "$standalone_path" --bootstrap-install --version "$resolved_version" --arch "$FLH_ARCH"; then
+"$standalone_path" --bootstrap-install --version "$resolved_version" --arch "$FLH_ARCH" &
+flh_bootstrap_child_pid=$!
+if wait "$flh_bootstrap_child_pid"; then
   install_status=0
 else
   install_status=$?
 fi
+flh_bootstrap_child_pid=""
 exit "$install_status"
