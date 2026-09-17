@@ -88,9 +88,10 @@ already in place.
    signed bare Mach-O as "not an app";
 7. invoke only that authenticated executable as
    `flh-darwin-arm64 --bootstrap-install --version <resolved> --arch arm64`;
-8. forward `HUP`/`INT`/`TERM` to the active transfer and the authenticated
-   bootstrap child, wait for the child's installer rollback/exit, and remove
-   the bootstrap temp directory on every exit path.
+8. map parent `HUP`/`INT`/`TERM` to graceful `TERM` cancellation for the active
+   transfer and authenticated bootstrap child, wait for the child's installer
+   rollback/exit, preserve the parent signal-style status, and remove the
+   bootstrap temp directory on every exit path.
 
 It does not parse release descriptors or installed manifests, extract
 archives, mutate LaunchAgents, or duplicate installer logic. The `flh`

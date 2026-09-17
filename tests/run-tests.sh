@@ -190,9 +190,14 @@ case $behavior in
     printf '200'
     exit "$stream_status"
     ;;
-  hang)
-    exec sleep 300
-    ;;
+hang)
+  # A curl launched as an asynchronous POSIX-shell job inherits ignored INT.
+  # TERM remains the reliable cancellation signal.
+  trap '' INT
+  trap 'printf "curl-signal TERM\n" >> "$FAKE_LOG"; exit 143' TERM
+  printf 'curl-ready\n' >> "$FAKE_LOG"
+  while :; do sleep 1; done
+  ;;
   *)
     exit 96
     ;;
@@ -304,7 +309,9 @@ write_standalone() {
   printf '\n'
 } >> "$FAKE_LOG"
 if [ "${FAKE_RUN_HANG:-0}" = "1" ]; then
-  trap 'printf "child-signal\n" >> "$FAKE_LOG"; exit 143' TERM INT HUP
+  trap 'printf "child-signal TERM\n" >> "$FAKE_LOG"; exit 143' TERM
+  trap 'printf "child-signal INT\n" >> "$FAKE_LOG"; exit 130' INT
+  trap 'printf "child-unsafe HUP\n" >> "$FAKE_LOG"; exit 129' HUP
   printf 'child-ready\n' >> "$FAKE_LOG"
   while :; do sleep 1; done
 fi
@@ -355,7 +362,8 @@ start_install() {
     FAKE_OVERSIZE_BYTES="$oversize_bytes" \
     FAKE_UNAME_S="$uname_s" \
     FAKE_UNAME_M="$uname_m" \
-    sh "$script" "$@" > "$stdout" 2> "$stderr" &
+    /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; $SIG{HUP} = "DEFAULT"; exec @ARGV' \
+      sh "$script" "$@" > "$stdout" 2> "$stderr" &
   background_pid=$!
 }
 
@@ -847,21 +855,22 @@ test_signal_cleanup() {
   alpha_behavior=hang
   start_install "$provisioned"
   waited=0
-  while [ ! -s "$log" ] && [ "$waited" -lt 100 ]; do
+  while ! grep -Fq 'curl-ready' "$log" 2>/dev/null && [ "$waited" -lt 100 ]; do
     sleep 0.1
     waited=$((waited + 1))
   done
-  if [ ! -s "$log" ]; then
-    fail "signal cleanup: script reached the hanging fetch"
+  if ! grep -Fq 'curl-ready' "$log" 2>/dev/null; then
+    fail "INT fetch cancellation: script reached the hanging fetch"
     kill "$background_pid" 2>/dev/null || true
     wait "$background_pid" 2>/dev/null || true
     return
   fi
-  kill -TERM "$background_pid" 2>/dev/null || true
+  kill -INT "$background_pid" 2>/dev/null || true
   wait "$background_pid" 2>/dev/null
   signal_status=$?
-  assert_eq "signal cleanup: TERM exit status" 143 "$signal_status"
-  assert_clean_sandbox "signal cleanup: temp cleaned"
+  assert_eq "INT fetch cancellation: exit status" 130 "$signal_status"
+  assert_contains "INT fetch cancellation: curl received TERM" "$log" "curl-signal TERM"
+  assert_clean_sandbox "INT fetch cancellation: temp cleaned"
 }
 
 test_signal_during_handoff() {
@@ -879,14 +888,19 @@ test_signal_during_handoff() {
     wait "$background_pid" 2>/dev/null || true
     return
   fi
-  kill -TERM "$background_pid" 2>/dev/null || true
+  kill -HUP "$background_pid" 2>/dev/null || true
   wait "$background_pid" 2>/dev/null
   signal_status=$?
-  assert_eq "handoff signal: exit status" 143 "$signal_status"
-  assert_contains "handoff signal: child received the forwarded signal" "$log" "child-signal"
+  assert_eq "HUP handoff cancellation: exit status" 129 "$signal_status"
+  assert_contains "HUP handoff cancellation: child received TERM" "$log" "child-signal TERM"
+  if grep -Fq 'child-unsafe HUP' "$log"; then
+    fail "HUP handoff cancellation: HUP was forwarded unsafely"
+  else
+    pass "HUP handoff cancellation: HUP was not forwarded"
+  fi
   assert_eq "handoff signal: one authenticated invocation" 1 "$(count_matching '^run ')"
-  assert_eq "handoff signal: child did not outlive the script" 1 "$(count_matching 'child-signal')"
-  assert_clean_sandbox "handoff signal: temp cleaned"
+  assert_eq "HUP handoff cancellation: child did not outlive the script" 1 "$(count_matching 'child-signal')"
+  assert_clean_sandbox "HUP handoff cancellation: temp cleaned"
 }
 
 test_repository_surface
