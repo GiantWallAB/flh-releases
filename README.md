@@ -62,16 +62,23 @@ already in place.
 1. require `Darwin` / `arm64`;
 2. parse strictly: no `--version`, or `--version <canonical production
    version>`; anything else is a usage error;
-3. with no `--version`, read `alpha.json` and require exactly one canonical
-   `version` (`v<major>.<minor>.<patch>-alpha.<ordinal>`) and exactly one
-   lowercase 64-hex `candidate_sha256`; additive fields are ignored, and an
-   absent version fails closed;
+3. with no `--version`, read `alpha.json` with a strict structural JSON reader
+   (the macOS system Perl and its core JSON::PP) and require exactly one
+   top-level canonical `version`
+   (`v<major>.<minor>.<patch>-alpha.<ordinal>`) and exactly one top-level
+   lowercase 64-hex `candidate_sha256`; additive fields (including nested
+   objects that reuse those names) are ignored, while malformed JSON, a
+   non-object root, duplicate decoded object keys, trailing data, non-string
+   identities, and an absent version all fail closed;
 4. create one private mode-0700 bootstrap temp directory;
 5. download `flh-darwin-arm64` over HTTPS with at most 5 redirects, a
    30-second connect/response-header deadline, a 5-minute per-attempt
    transfer deadline, at most 3 transport attempts (a verification failure is
-   never retried), and a 128 MiB cap enforced on both the declared length and
-   the bytes actually written;
+   never retried), and a 128 MiB cap enforced on the declared length, on the
+   streamed transfer (the transfer subshell lowers the OS file-size limit to
+   the cap and then execs curl, so an unknown-length oversize stream is
+   stopped at the cap on every system curl version, including ones older than
+   curl 8.4.0), and on the bytes actually downloaded;
 6. authenticate the downloaded executable with the full Apple chain before
    anything downloaded may run: `codesign --verify --strict --verbose=4`, the
    exact pinned `TeamIdentifier`, the exact pinned code identifier, the
@@ -81,7 +88,9 @@ already in place.
    signed bare Mach-O as "not an app";
 7. invoke only that authenticated executable as
    `flh-darwin-arm64 --bootstrap-install --version <resolved> --arch arm64`;
-8. remove the bootstrap temp directory on every exit path.
+8. forward `HUP`/`INT`/`TERM` to the active transfer and the authenticated
+   bootstrap child, wait for the child's installer rollback/exit, and remove
+   the bootstrap temp directory on every exit path.
 
 It does not parse release descriptors or installed manifests, extract
 archives, mutate LaunchAgents, or duplicate installer logic. The `flh`
@@ -120,6 +129,10 @@ sh tests/run-tests.sh
 ```
 
 It stubs `curl`, `codesign`, and `uname` on `PATH` to prove Darwin/arm64
-gating, strict argument parsing, `alpha.json` minimum-field resolution,
-acquisition bounds and redirect handling, attempt limits, Apple verification
-order and pins, the exact standalone invocation, and temp-directory cleanup.
+gating, strict argument parsing and whole-string version validation,
+structural `alpha.json` minimum-field resolution (additive fields, duplicate
+keys, nested-only identities, escapes, and malformed documents), acquisition
+bounds and redirect handling, attempt limits, the OS-enforced stream cap on
+an unknown-length oversize body, Apple verification order and pins, the exact
+standalone invocation, signal forwarding during fetch and during the
+authenticated handoff, and temp-directory cleanup.
