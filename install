@@ -1,0 +1,391 @@
+#!/bin/sh
+# flh-releases public bootstrap (canonical `install` text):
+#
+#   curl -fsSL https://raw.githubusercontent.com/GiantWallAB/flh-releases/main/install | sh
+#
+# Trust boundary: this text is trusted by provenance (GitHub repository write
+# control plus HTTPS), not by an FLH release signature. The canonical curl|sh
+# form retrieves it with the invoking shell's own curl before any FLH code
+# runs, so neither that outer transfer nor its bytes are bounded by this
+# script. Every fetch this script performs after its first statement is
+# bounded below, and every release decision it does not own is delegated to
+# the Apple-authenticated `flh-darwin-arm64 --bootstrap-install` entrypoint.
+#
+# This script owns only:
+#   - the Darwin/arm64 host gate
+#   - strict argument parsing (no --version, or --version <canonical version>)
+#   - no-version alpha.json resolution (minimum fields only)
+#   - one private mode-0700 bootstrap temp directory
+#   - bounded HTTPS download and full Apple verification of flh-darwin-arm64
+#   - invocation of the authenticated standalone bootstrap executable
+#   - bootstrap temp cleanup on every exit path
+#
+# It does not parse release descriptors or installed manifests, extract
+# archives, mutate LaunchAgents, or duplicate installer logic. The shell
+# installer inside the authenticated release remains the sole mutation,
+# locking, revalidation, and rollback owner.
+
+set -eu
+umask 077
+LC_ALL=C
+export LC_ALL
+
+FLH_RELEASES_REPOSITORY="GiantWallAB/flh-releases"
+FLH_RELEASES_BRANCH="main"
+FLH_ALPHA_JSON_URL="https://raw.githubusercontent.com/${FLH_RELEASES_REPOSITORY}/${FLH_RELEASES_BRANCH}/alpha.json"
+FLH_RELEASE_BASE_URL="https://github.com/${FLH_RELEASES_REPOSITORY}/releases/download"
+FLH_STANDALONE_NAME="flh-darwin-arm64"
+FLH_ARCH="arm64"
+
+# Acquisition byte caps. A response whose declared length exceeds its cap
+# fails before the body is accepted; a stream that exceeds its cap aborts and
+# is never executed.
+FLH_ALPHA_JSON_MAX_BYTES=$((64 * 1024))
+FLH_STANDALONE_MAX_BYTES=$((128 * 1024 * 1024))
+
+# Shared acquisition deadlines and attempt/redirect bounds: HTTPS only, at
+# most five redirects, a 30-second connect/response-header deadline, a
+# 5-minute transfer deadline per attempt, and at most three attempts.
+FLH_CONNECT_TIMEOUT_SECONDS=30
+FLH_TRANSFER_TIMEOUT_SECONDS=300
+FLH_MAX_ATTEMPTS=3
+FLH_MAX_REDIRECTS=5
+
+# ---------------------------------------------------------------------------
+# Reviewed production Apple release identity (intentionally unprovisioned).
+#
+# These three constants are the pins this script authenticates the downloaded
+# standalone executable against. The FLH project has not provisioned its
+# production Apple Developer ID identity yet, so they are empty. While any of
+# them is empty, or does not satisfy the canonical shape below, the script
+# fails closed before any network fetch and before any downloaded executable
+# can run. Provisioning is a reviewed change to exactly these three values;
+# no identity may be invented here.
+# ---------------------------------------------------------------------------
+FLH_APPLE_TEAM_ID=""
+FLH_APPLE_CODE_IDENTIFIER=""
+FLH_APPLE_DESIGNATED_REQUIREMENT=""
+
+flh_bootstrap_tmp=""
+flh_curl_pid=""
+
+fail() {
+  printf 'flh install: %s\n' "$1" >&2
+  exit 1
+}
+
+usage() {
+  printf 'flh install: %s\n' "$1" >&2
+  printf 'usage: curl -fsSL https://raw.githubusercontent.com/GiantWallAB/flh-releases/main/install | sh -s -- [--version <version>]\n' >&2
+  exit 2
+}
+
+cleanup() {
+  if [ -n "$flh_bootstrap_tmp" ] && [ -d "$flh_bootstrap_tmp" ]; then
+    rm -rf -- "$flh_bootstrap_tmp" 2>/dev/null || true
+  fi
+}
+
+on_signal() {
+  if [ -n "$flh_curl_pid" ]; then
+    kill "$flh_curl_pid" 2>/dev/null || true
+  fi
+  exit "$1"
+}
+
+# is_production_version checks the canonical production grammar
+# v<major>.<minor>.<patch>-alpha.<ordinal>; no other suffix, build metadata,
+# or prerelease identifier is a production version.
+is_production_version() {
+  printf '%s\n' "$1" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha\.(0|[1-9][0-9]*)$'
+}
+
+require_https_url() {
+  case $1 in
+    https://*@*) return 1 ;;
+    https://?*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# require_apple_pins validates the reviewed pins and fails closed while they
+# are unprovisioned or noncanonical, before any network fetch.
+require_apple_pins() {
+  if [ -z "$FLH_APPLE_TEAM_ID" ] || [ -z "$FLH_APPLE_CODE_IDENTIFIER" ] || [ -z "$FLH_APPLE_DESIGNATED_REQUIREMENT" ]; then
+    fail "the pinned Apple release identity is not provisioned; refusing to download release bytes until a reviewed change pins the FLH Team ID, code identifier, and designated requirement"
+  fi
+  case $FLH_APPLE_TEAM_ID in
+    [A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9]) ;;
+    *) fail "the pinned Apple Team ID must be exactly ten uppercase alphanumeric characters" ;;
+  esac
+  case $FLH_APPLE_CODE_IDENTIFIER in
+    [A-Za-z0-9]*) ;;
+    *) fail "the pinned Apple code identifier is not a bounded safe identifier" ;;
+  esac
+  if [ "${#FLH_APPLE_CODE_IDENTIFIER}" -gt 128 ]; then
+    fail "the pinned Apple code identifier is not a bounded safe identifier"
+  fi
+  if [ -n "$(printf '%s' "$FLH_APPLE_CODE_IDENTIFIER" | tr -d 'A-Za-z0-9.-')" ]; then
+    fail "the pinned Apple code identifier is not a bounded safe identifier"
+  fi
+  flh_expected_requirement="identifier \"$FLH_APPLE_CODE_IDENTIFIER\" and anchor apple generic and certificate leaf[subject.OU] = \"$FLH_APPLE_TEAM_ID\""
+  if [ "$FLH_APPLE_DESIGNATED_REQUIREMENT" != "$flh_expected_requirement" ]; then
+    fail "the pinned Apple designated requirement must be exactly identifier \"<code identifier>\" and anchor apple generic and certificate leaf[subject.OU] = \"<Team ID>\""
+  fi
+}
+
+curl_error_excerpt() {
+  if [ -s "$flh_curl_error_file" ]; then
+    head -c 512 "$flh_curl_error_file" 2>/dev/null | tr '\n' ' '
+  else
+    printf 'transport failure'
+  fi
+}
+
+# run_curl_once performs one bounded HTTPS attempt: HTTPS only for the URL
+# and every redirect target, at most FLH_MAX_REDIRECTS redirects, a
+# connect/response-header stall deadline of FLH_CONNECT_TIMEOUT_SECONDS (the
+# speed floor aborts a connected peer that sends fewer than 1 byte per second
+# for that window), a per-attempt transfer deadline, and a byte cap enforced
+# both on the declared length and on the bytes actually written. Redirect
+# policy and transport failures are classified by the caller.
+run_curl_once() {
+  flh_curl_status_file=$flh_bootstrap_tmp/curl-status
+  flh_curl_error_file=$flh_bootstrap_tmp/curl-error
+  rm -f -- "$2" "$flh_curl_status_file" "$flh_curl_error_file"
+  : > "$flh_curl_status_file"
+  : > "$flh_curl_error_file"
+  curl --disable \
+    --proto '=https' \
+    --proto-redir '=https' \
+    --max-redirs "$FLH_MAX_REDIRECTS" \
+    --location \
+    --connect-timeout "$FLH_CONNECT_TIMEOUT_SECONDS" \
+    --speed-limit 1 \
+    --speed-time "$FLH_CONNECT_TIMEOUT_SECONDS" \
+    --max-time "$FLH_TRANSFER_TIMEOUT_SECONDS" \
+    --max-filesize "$3" \
+    --silent --show-error \
+    --output "$2" \
+    --write-out '%{http_code}' \
+    "$1" < /dev/null > "$flh_curl_status_file" 2> "$flh_curl_error_file" &
+  flh_curl_pid=$!
+  if wait "$flh_curl_pid"; then
+    flh_curl_status=0
+  else
+    flh_curl_status=$?
+  fi
+  flh_curl_pid=""
+}
+
+fetch_retry() {
+  printf 'flh install: %s failed (%s); retrying (attempt %s of %s)\n' "$1" "$2" "$fetch_attempt" "$FLH_MAX_ATTEMPTS" >&2
+  fetch_attempt=$((fetch_attempt + 1))
+  if [ "$fetch_attempt" -gt "$FLH_MAX_ATTEMPTS" ]; then
+    fail "$1 failed after $FLH_MAX_ATTEMPTS attempts ($2)"
+  fi
+}
+
+# fetch_bounded downloads one artifact into the private temp directory under
+# its byte cap. Transport failures, timeouts, and retryable HTTP statuses get
+# at most three attempts; non-HTTPS URLs/redirects, a redirect-limit
+# violation, an oversized body, and other HTTP statuses fail closed without a
+# retry. Verification failures are outside this loop and are never retried.
+fetch_bounded() {
+  fetch_url=$1
+  fetch_destination=$2
+  fetch_cap=$3
+  fetch_description=$4
+  if ! require_https_url "$fetch_url"; then
+    fail "$fetch_description URL must be HTTPS"
+  fi
+  fetch_attempt=1
+  while [ "$fetch_attempt" -le "$FLH_MAX_ATTEMPTS" ]; do
+    run_curl_once "$fetch_url" "$fetch_destination" "$fetch_cap"
+    flh_http_code=$(tr -d '[:space:]' < "$flh_curl_status_file" 2>/dev/null || true)
+    if [ "$flh_curl_status" -eq 0 ]; then
+      case $flh_http_code in
+        200) ;;
+        408|425|429|5??)
+          fetch_retry "$fetch_description" "HTTP status $flh_http_code"
+          continue
+          ;;
+        4??)
+          fail "$fetch_description failed with HTTP status $flh_http_code"
+          ;;
+        *)
+          fail "$fetch_description returned an unexpected HTTP status"
+          ;;
+      esac
+    else
+      case $flh_curl_status in
+        63) fail "$fetch_description exceeds its $fetch_cap-byte limit" ;;
+        47) fail "$fetch_description exceeded the $FLH_MAX_REDIRECTS-redirect limit" ;;
+        1) fail "$fetch_description refused a non-HTTPS URL or redirect" ;;
+        *)
+          fetch_retry "$fetch_description" "$(curl_error_excerpt)"
+          continue
+          ;;
+      esac
+    fi
+    if [ ! -f "$fetch_destination" ] || [ -L "$fetch_destination" ]; then
+      fail "$fetch_description did not produce a regular private file"
+    fi
+    fetch_size=$(wc -c < "$fetch_destination" 2>/dev/null | tr -d '[:space:]') || true
+    case $fetch_size in
+      ''|*[!0-9]*) fail "$fetch_description size is unreadable" ;;
+    esac
+    if [ "$fetch_size" -eq 0 ]; then
+      fail "$fetch_description is empty"
+    fi
+    if [ "$fetch_size" -gt "$fetch_cap" ]; then
+      fail "$fetch_description exceeds its $fetch_cap-byte limit"
+    fi
+    return 0
+  done
+  fail "$fetch_description failed after $FLH_MAX_ATTEMPTS attempts"
+}
+
+# parse_alpha_json reads the promoted version from the minimum alpha.json
+# shape: exactly one canonical production `version` string and exactly one
+# canonical lowercase `candidate_sha256`. Additive fields are ignored and the
+# absent-version initial state fails closed without guessing.
+parse_alpha_json() {
+  alpha_raw=$(cat "$1") || fail "unable to read the downloaded alpha.json"
+  alpha_trimmed=$(printf '%s' "$alpha_raw" | tr -d '[:space:]')
+  case $alpha_trimmed in
+    \{*\}) ;;
+    *) fail "alpha.json is not a JSON object" ;;
+  esac
+  alpha_version_count=$(printf '%s\n' "$alpha_raw" | grep -o '"version"[[:space:]]*:' | wc -l | tr -d '[:space:]')
+  if [ "$alpha_version_count" -eq 0 ]; then
+    fail "alpha.json carries no promoted version; pass --version <production-version> to install an exact release"
+  fi
+  if [ "$alpha_version_count" -ne 1 ]; then
+    fail "alpha.json is malformed: it names more than one version field"
+  fi
+  alpha_candidate_count=$(printf '%s\n' "$alpha_raw" | grep -o '"candidate_sha256"[[:space:]]*:' | wc -l | tr -d '[:space:]')
+  if [ "$alpha_candidate_count" -ne 1 ]; then
+    fail "alpha.json is malformed: it must carry exactly one candidate_sha256"
+  fi
+  flh_alpha_version=$(printf '%s\n' "$alpha_raw" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if ! is_production_version "$flh_alpha_version"; then
+    fail "alpha.json version is not a production version v<major>.<minor>.<patch>-alpha.<ordinal>"
+  fi
+  alpha_candidate=$(printf '%s\n' "$alpha_raw" | sed -n 's/.*"candidate_sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if ! printf '%s\n' "$alpha_candidate" | grep -Eq '^[0-9a-f]{64}$'; then
+    fail "alpha.json candidate_sha256 is not a canonical lowercase SHA-256"
+  fi
+}
+
+# verify_apple_signature applies the full Apple authentication chain to the
+# downloaded standalone executable before it may run: strict signature
+# verification, the exact pinned TeamIdentifier and code identifier, the
+# pinned designated requirement, and the explicit online notarization-ticket
+# check. spctl is deliberately absent: it rejects a validly signed bare
+# Mach-O as "not an app".
+verify_apple_signature() {
+  apple_binary=$1
+  if ! codesign --verify --strict --verbose=4 "$apple_binary"; then
+    fail "the downloaded release executable does not satisfy codesign --verify --strict"
+  fi
+  if ! apple_display=$(codesign --display --verbose=4 "$apple_binary" 2>&1); then
+    fail "unable to inspect the downloaded release executable signature"
+  fi
+  apple_team=$(printf '%s\n' "$apple_display" | sed -n 's/^TeamIdentifier=\(.*\)$/\1/p')
+  if [ "$apple_team" != "$FLH_APPLE_TEAM_ID" ]; then
+    fail "the downloaded release executable does not carry the pinned FLH Apple Team ID"
+  fi
+  apple_identifier=$(printf '%s\n' "$apple_display" | sed -n 's/^Identifier=\(.*\)$/\1/p')
+  if [ "$apple_identifier" != "$FLH_APPLE_CODE_IDENTIFIER" ]; then
+    fail "the downloaded release executable does not carry the pinned FLH code identifier"
+  fi
+  if ! codesign --verify "-R=$FLH_APPLE_DESIGNATED_REQUIREMENT" "$apple_binary"; then
+    fail "the downloaded release executable does not satisfy the pinned designated requirement"
+  fi
+  if ! codesign --verify --strict --verbose=4 --check-notarization -R=notarized "$apple_binary"; then
+    fail "the downloaded release executable has no notarization ticket"
+  fi
+}
+
+# -- strict CLI modes: no --version resolves alpha.json; --version installs
+# exactly that production version without consulting alpha.json. Any other
+# argument fails before any fetch.
+requested_version=""
+version_seen=0
+if [ "$#" -gt 0 ]; then
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--version" ]; then
+      if [ "$version_seen" -ne 0 ]; then
+        usage "--version may be given only once"
+      fi
+      version_seen=1
+      shift
+      if [ "$#" -eq 0 ]; then
+        usage "--version requires a canonical production version"
+      fi
+      requested_version=$1
+      shift
+    else
+      usage "unknown argument: $1"
+    fi
+  done
+fi
+if [ "$version_seen" -ne 0 ] && ! is_production_version "$requested_version"; then
+  usage "the requested version is not a canonical production version v<major>.<minor>.<patch>-alpha.<ordinal>"
+fi
+
+host_platform=$(uname -s 2>/dev/null) || fail "unable to detect the host platform"
+host_architecture=$(uname -m 2>/dev/null) || fail "unable to detect the host architecture"
+if [ "$host_platform" != "Darwin" ]; then
+  fail "unsupported platform ${host_platform}; the FLH alpha bootstrap supports darwin/arm64 only"
+fi
+if [ "$host_architecture" != "$FLH_ARCH" ]; then
+  fail "unsupported architecture ${host_architecture}; the FLH alpha bootstrap supports darwin/arm64 only"
+fi
+
+require_apple_pins
+command -v curl >/dev/null 2>&1 || fail "curl is required to download release bytes"
+command -v codesign >/dev/null 2>&1 || fail "codesign is required to authenticate the downloaded release executable"
+
+flh_tmp_parent=${TMPDIR:-/tmp}
+flh_tmp_parent=${flh_tmp_parent%/}
+if [ -z "$flh_tmp_parent" ]; then
+  flh_tmp_parent=/
+fi
+if [ ! -d "$flh_tmp_parent" ]; then
+  fail "the temporary directory $flh_tmp_parent does not exist"
+fi
+flh_bootstrap_tmp=$(mktemp -d "$flh_tmp_parent/flh-bootstrap.XXXXXX") || fail "unable to create the private bootstrap temp directory"
+flh_bootstrap_tmp=$(cd "$flh_bootstrap_tmp" && pwd -P) || fail "unable to resolve the private bootstrap temp directory"
+chmod 700 "$flh_bootstrap_tmp" || fail "unable to secure the private bootstrap temp directory"
+if [ "$(id -u)" != "$(stat -f '%u' "$flh_bootstrap_tmp")" ]; then
+  fail "the private bootstrap temp directory must be owned by the invoking user"
+fi
+trap 'cleanup' EXIT
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+if [ "$version_seen" -ne 0 ]; then
+  resolved_version=$requested_version
+else
+  alpha_path=$flh_bootstrap_tmp/alpha.json
+  fetch_bounded "$FLH_ALPHA_JSON_URL" "$alpha_path" "$FLH_ALPHA_JSON_MAX_BYTES" "alpha.json"
+  parse_alpha_json "$alpha_path"
+  resolved_version=$flh_alpha_version
+fi
+
+standalone_url="${FLH_RELEASE_BASE_URL}/${resolved_version}/${FLH_STANDALONE_NAME}"
+standalone_path=$flh_bootstrap_tmp/$FLH_STANDALONE_NAME
+fetch_bounded "$standalone_url" "$standalone_path" "$FLH_STANDALONE_MAX_BYTES" "$FLH_STANDALONE_NAME"
+verify_apple_signature "$standalone_path"
+chmod 500 "$standalone_path" || fail "unable to mark the authenticated release executable executable"
+
+printf 'flh install: handing off to the authenticated %s darwin/%s bootstrap\n' "$resolved_version" "$FLH_ARCH" >&2
+if "$standalone_path" --bootstrap-install --version "$resolved_version" --arch "$FLH_ARCH"; then
+  install_status=0
+else
+  install_status=$?
+fi
+exit "$install_status"
